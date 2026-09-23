@@ -1,3 +1,4 @@
+import 'dart:convert';
 import 'package:flutter/material.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
 import '../models/interaccion_model.dart'; // Tu traductor de JSON
@@ -14,31 +15,109 @@ class _ChatScreenState extends State<ChatScreen> {
   // Cliente de Supabase
   final _supabase = Supabase.instance.client;
 
-  // Función para enviar texto a Supabase
+  // ─────────────────────────────────────────────────────────────────────────
+  // CAPA DE INTEGRACIÓN: Edge Function app_mensajeria
+  // ─────────────────────────────────────────────────────────────────────────
+  // Contrato JSON que acepta la Edge Function:
+  //   {
+  //     "mac_address" : string  → MAC del dispositivo CoCo de destino
+  //     "tipo_mensaje": "TEXTO" | "AUDIO_NATIVO"
+  //     "texto"       : string | null  → solo cuando tipo_mensaje == "TEXTO"
+  //     "audio_url"   : string | null  → solo cuando tipo_mensaje == "AUDIO_NATIVO"
+  //   }
+  //
+  // SEGURIDAD: El header Authorization: Bearer <jwt> se extrae de la sesión
+  // activa de Supabase Auth y se inyecta manualmente para que la Edge Function
+  // pueda validar la identidad del familiar antes de ejecutarse.
+  // ─────────────────────────────────────────────────────────────────────────
+
+  /// Método privado central que dispara el POST a la Edge Function.
+  /// Acepta [tipoMensaje] ("TEXTO" o "AUDIO_NATIVO"), [texto] y [audioUrl].
+  Future<void> _invocarEdgeFunction({
+    required String tipoMensaje,
+    String? texto,
+    String? audioUrl,
+  }) async {
+    // 1. Extraer el JWT de la sesión activa de Supabase Auth.
+    //    Si no hay sesión, no hay token y el servidor rechazaría la petición.
+    final session = _supabase.auth.currentSession;
+    final jwt = session?.accessToken;
+
+    if (jwt == null) {
+      print('Error: No hay sesión activa. El usuario debe iniciar sesión.');
+      return;
+    }
+
+    // 2. Construir el body según el contrato acordado con el backend.
+    final body = {
+      'mac_address': '00:11:22:AA:BB:CC', // TODO: Obtener la MAC del dispositivo CoCo desde la BD
+      'tipo_mensaje': tipoMensaje,
+      'texto': texto,       // null cuando es AUDIO_NATIVO
+      'audio_url': audioUrl, // null cuando es TEXTO
+    };
+
+    try {
+      // 3. Disparar el POST. supabase.functions.invoke ya gestiona el baseUrl
+      //    correcto del proyecto. Inyectamos el JWT explícitamente en headers
+      //    para cumplir el requisito de seguridad de la Edge Function.
+      final response = await _supabase.functions.invoke(
+        'app_mensajeria',
+        method: HttpMethod.post,
+        headers: {
+          'Authorization': 'Bearer $jwt', // ← JWT explícito requerido por la EF
+          'Content-Type': 'application/json',
+        },
+        body: body,
+      );
+
+      // 4. Evaluar la respuesta
+      if (response.status == 200 || response.status == 201) {
+        print('app_mensajeria OK [${response.status}]: mensaje enrutado.');
+      } else {
+        final errorDetail = response.data != null
+            ? jsonEncode(response.data)
+            : 'Sin detalles del servidor';
+        print('Error de app_mensajeria [${response.status}]: $errorDetail');
+      }
+    } on FunctionException catch (e) {
+      print('FunctionException: ${e.reasonPhrase} — detalle: ${e.details}');
+    } catch (e) {
+      print('Error inesperado al contactar la Edge Function: $e');
+    }
+  }
+
+  // ─────────────────────────────────────────────────────────────────────────
+  // CASO 1: El familiar escribe un mensaje de TEXTO
+  // tipo_mensaje = "TEXTO" | texto = <input del usuario> | audio_url = null
+  // ─────────────────────────────────────────────────────────────────────────
   Future<void> _enviarMensaje() async {
     final texto = _messageController.text.trim();
     if (texto.isEmpty) return;
 
-    // 1. Limpiar el campo de texto inmediatamente para una buena UX
+    // Limpiar el input inmediatamente para buena UX (no esperar la respuesta)
     _messageController.clear();
 
-    try {
-      // 2. Insertar la fila respetando el contrato de la base de datos
-      await _supabase.from('historial_interacciones').insert({
-        'emisor': 'APP', // Indica que el mensaje viene del familiar 
-        'tipo_evento': 'MENSAJE', 
-        'estado_reproduccion': 'PENDIENTE', 
-        'prioridad': 'NORMAL', 
-        'metadata_payload': {
-          'texto_procesado': texto, 
-          'url_audio_referencia': null, 
-          'procesado_por_ia': false, 
-        }
-      });
-    } catch (e) {
-      print("Error al enviar mensaje: $e");
-    }
+    await _invocarEdgeFunction(
+      tipoMensaje: 'TEXTO',
+      texto: texto,
+      audioUrl: null,
+    );
   }
+
+  // ─────────────────────────────────────────────────────────────────────────
+  // CASO 2: El familiar graba un AUDIO desde la app
+  // tipo_mensaje = "AUDIO_NATIVO" | texto = null | audio_url = <url en Storage>
+  // (Se llama desde el botón de micrófono una vez que el audio esté subido
+  //  al Supabase Storage y se tenga su URL pública o firmada)
+  // ─────────────────────────────────────────────────────────────────────────
+  Future<void> _enviarAudio(String audioUrl) async {
+    await _invocarEdgeFunction(
+      tipoMensaje: 'AUDIO_NATIVO',
+      texto: null,
+      audioUrl: audioUrl,
+    );
+  }
+
 
   @override
   Widget build(BuildContext context) {
@@ -223,7 +302,14 @@ class _ChatScreenState extends State<ChatScreen> {
             child: IconButton(
               icon: const Icon(Icons.mic, color: Colors.white, size: 22),
               onPressed: () {
-                print("Iniciando grabación de audio...");
+                // TODO: Implementar grabación de audio con flutter_sound o record,
+                // subirlo a Supabase Storage y obtener su URL. Luego llamar:
+                // _enviarAudio(audioUrl);
+                //
+                // Ejemplo de llamada final una vez obtenida la URL:
+                // final audioUrl = await _subirAudioAStorage(archivoGrabado);
+                // _enviarAudio(audioUrl);
+                print('Grabación de audio pendiente de implementar.');
               },
             ),
           ),
